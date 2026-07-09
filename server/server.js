@@ -7,9 +7,9 @@ import crypto from "crypto";
 import dotenv from "dotenv";
 import webpush from "web-push";
 
-dotenv.config();
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(__dirname, ".env") });
+
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
