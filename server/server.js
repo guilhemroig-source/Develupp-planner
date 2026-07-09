@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 import Database from "better-sqlite3";
 import crypto from "crypto";
 import dotenv from "dotenv";
+import webpush from "web-push";
 
 dotenv.config();
 
@@ -19,6 +20,9 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
 const HIGGSFIELD_MCP_URL = "https://mcp.higgsfield.ai/mcp";
 const ANTHROPIC_MODEL = "claude-sonnet-4-6"; // keep in sync with Anthropic's current models
+const VAPID_CONTACT_EMAIL = process.env.VAPID_CONTACT_EMAIL || "contact@example.com";
+const REMINDER_TIMEZONE = process.env.REMINDER_TIMEZONE || "Europe/Paris";
+const REMINDER_HOUR = Number(process.env.REMINDER_HOUR || 9); // 24h local time in REMINDER_TIMEZONE
 
 if (!ANTHROPIC_API_KEY) {
   console.warn("⚠️  ANTHROPIC_API_KEY absente — la génération Higgsfield échouera. Voir .env.example.");
@@ -67,7 +71,47 @@ CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
   created_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  endpoint TEXT PRIMARY KEY,
+  p256dh TEXT,
+  auth TEXT,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS kv_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 `);
+
+// Lightweight migration: add reminder_sent_date to items if it's missing
+// (safe to run every boot — checks first).
+const itemColumns = db.prepare("PRAGMA table_info(items)").all().map((c) => c.name);
+if (!itemColumns.includes("reminder_sent_date")) {
+  db.exec("ALTER TABLE items ADD COLUMN reminder_sent_date TEXT");
+}
+
+// ---------- VAPID keys (generated once, stored in DB — no manual setup needed) ----------
+
+function ensureVapidKeys() {
+  const pub = db.prepare("SELECT value FROM kv_settings WHERE key = 'vapid_public'").get();
+  const priv = db.prepare("SELECT value FROM kv_settings WHERE key = 'vapid_private'").get();
+  if (pub?.value && priv?.value) {
+    return { publicKey: pub.value, privateKey: priv.value };
+  }
+  const keys = webpush.generateVAPIDKeys();
+  const upsert = db.prepare(`
+    INSERT INTO kv_settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+  upsert.run("vapid_public", keys.publicKey);
+  upsert.run("vapid_private", keys.privateKey);
+  return keys;
+}
+
+const VAPID_KEYS = ensureVapidKeys();
+webpush.setVapidDetails(`mailto:${VAPID_CONTACT_EMAIL}`, VAPID_KEYS.publicKey, VAPID_KEYS.privateKey);
 
 function rowToItem(r) {
   return {
@@ -502,6 +546,134 @@ Réponds UNIQUEMENT avec un objet JSON strict, sans texte autour, sans balises m
     res.status(200).json({ error: e.message });
   }
 });
+
+// ---------- Push notifications ----------
+
+app.get("/api/push/vapid-public-key", requireAuth, (req, res) => {
+  res.json({ publicKey: VAPID_KEYS.publicKey });
+});
+
+app.post("/api/push/subscribe", requireAuth, (req, res) => {
+  const sub = req.body || {};
+  if (!sub.endpoint || !sub.keys?.p256dh || !sub.keys?.auth) {
+    return res.status(400).json({ error: "Abonnement invalide." });
+  }
+  db.prepare(`
+    INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth
+  `).run(sub.endpoint, sub.keys.p256dh, sub.keys.auth, new Date().toISOString());
+  res.json({ ok: true });
+});
+
+app.post("/api/push/unsubscribe", requireAuth, (req, res) => {
+  const { endpoint } = req.body || {};
+  if (endpoint) db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").run(endpoint);
+  res.json({ ok: true });
+});
+
+app.get("/api/push/status", requireAuth, (req, res) => {
+  const count = db.prepare("SELECT COUNT(*) AS n FROM push_subscriptions").get().n;
+  res.json({ subscribed: count > 0 });
+});
+
+async function sendPushToAll(payload) {
+  const subs = db.prepare("SELECT * FROM push_subscriptions").all();
+  for (const sub of subs) {
+    try {
+      await webpush.sendNotification(
+        { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+        JSON.stringify(payload)
+      );
+    } catch (e) {
+      if (e.statusCode === 404 || e.statusCode === 410) {
+        db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ?").run(sub.endpoint);
+      } else {
+        console.error("Erreur envoi push:", e.message);
+      }
+    }
+  }
+}
+
+app.post("/api/push/test", requireAuth, async (req, res) => {
+  const count = db.prepare("SELECT COUNT(*) AS n FROM push_subscriptions").get().n;
+  if (count === 0) {
+    return res.status(400).json({ error: "Aucun abonnement actif — active d'abord les notifications." });
+  }
+  try {
+    await sendPushToAll({
+      title: "Develupp",
+      body: "Notification de test — si tu vois ça, c'est branché 🎉",
+      url: "/",
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- Daily reminder scheduler ----------
+
+function todayInTimezone(tz) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return `${map.year}-${map.month}-${map.day}`; // YYYY-MM-DD
+}
+
+function currentHourInTimezone(tz) {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", hour12: false }).formatToParts(
+    new Date()
+  );
+  const hourPart = parts.find((p) => p.type === "hour").value;
+  return Number(hourPart) % 24;
+}
+
+async function runReminderCheck() {
+  const hour = currentHourInTimezone(REMINDER_TIMEZONE);
+  if (hour !== REMINDER_HOUR) return;
+
+  const today = todayInTimezone(REMINDER_TIMEZONE);
+  const due = db
+    .prepare(
+      `SELECT * FROM items WHERE date = ? AND stage != 'published' AND (reminder_sent_date IS NULL OR reminder_sent_date != ?)`
+    )
+    .all(today, today);
+
+  if (due.length === 0) return;
+
+  const subCount = db.prepare("SELECT COUNT(*) AS n FROM push_subscriptions").get().n;
+  if (subCount === 0) return;
+
+  for (const item of due) {
+    const platformLabel = PLATFORM_LABELS[item.platform] || item.platform;
+    await sendPushToAll({
+      title: "À poster aujourd'hui",
+      body: `${platformLabel} — ${item.title || "(sans titre)"}`,
+      url: "/",
+    });
+    db.prepare("UPDATE items SET reminder_sent_date = ? WHERE id = ?").run(today, item.id);
+  }
+}
+
+const PLATFORM_LABELS = {
+  instagram: "Instagram",
+  tiktok: "TikTok",
+  linkedin: "LinkedIn",
+  youtube: "YouTube",
+};
+
+setInterval(() => {
+  runReminderCheck().catch((e) => console.error("Erreur vérification rappels:", e.message));
+}, 15 * 60 * 1000);
+// also check once shortly after boot, in case the server restarts right at the reminder hour
+setTimeout(() => {
+  runReminderCheck().catch((e) => console.error("Erreur vérification rappels:", e.message));
+}, 10 * 1000);
 
 // ---------- Static frontend ----------
 

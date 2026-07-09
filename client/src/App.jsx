@@ -269,6 +269,17 @@ function buildPromptForItem(item) {
 
 // ---------- Backend API helper ----------
 
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
+
 async function apiFetch(path, options = {}) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -375,6 +386,48 @@ function DevelupContentPlanner() {
   const [dayPanelDate, setDayPanelDate] = useState(null);
   const [editingItem, setEditingItem] = useState(null);
   const [generated, setGenerated] = useState({});
+  const [pushSubscribed, setPushSubscribed] = useState(null);
+  const [pushMsg, setPushMsg] = useState(null);
+
+  const isIOS = typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+  const isStandalone =
+    typeof window !== "undefined" &&
+    (window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true);
+
+  async function enableNotifications() {
+    setPushMsg(null);
+    try {
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+        throw new Error("Ton navigateur ne supporte pas les notifications push.");
+      }
+      const reg = await navigator.serviceWorker.register("/sw.js");
+      await navigator.serviceWorker.ready;
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        throw new Error("Permission refusée — vérifie les réglages de notifications de ton navigateur.");
+      }
+      const { publicKey } = await apiFetch("/api/push/vapid-public-key");
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+      await apiFetch("/api/push/subscribe", { method: "POST", body: JSON.stringify(sub.toJSON()) });
+      setPushSubscribed(true);
+      setPushMsg({ type: "success", text: "Notifications activées." });
+    } catch (e) {
+      setPushMsg({ type: "error", text: e.message });
+    }
+  }
+
+  async function testNotification() {
+    setPushMsg(null);
+    try {
+      await apiFetch("/api/push/test", { method: "POST" });
+      setPushMsg({ type: "success", text: "Notification de test envoyée." });
+    } catch (e) {
+      setPushMsg({ type: "error", text: e.message });
+    }
+  }
 
   useEffect(() => {
     (async () => {
@@ -391,6 +444,18 @@ function DevelupContentPlanner() {
     apiFetch("/api/higgsfield/auth/status")
       .then((r) => setHgConnected(r.connected))
       .catch(() => setHgConnected(false));
+
+    if ("serviceWorker" in navigator && "PushManager" in window) {
+      navigator.serviceWorker
+        .register("/sw.js")
+        .then(async (reg) => {
+          const sub = await reg.pushManager.getSubscription();
+          setPushSubscribed(!!sub);
+        })
+        .catch(() => setPushSubscribed(false));
+    } else {
+      setPushSubscribed(false);
+    }
 
     const params = new URLSearchParams(window.location.search);
     if (params.get("higgsfield") === "connected") {
@@ -511,6 +576,45 @@ function DevelupContentPlanner() {
             <span>Higgsfield n'est pas encore connecté à cette app.</span>
             <span className="font-medium whitespace-nowrap">Connecter →</span>
           </a>
+        )}
+
+        {pushSubscribed === false && isIOS && !isStandalone && (
+          <div className="mb-4 bg-amber-50 border border-amber-200 rounded-md px-3 py-2.5 text-xs text-amber-800">
+            Pour recevoir les rappels sur iPhone, ajoute d'abord ce site à l'écran d'accueil : appuie sur{" "}
+            <strong>Partager</strong> dans Safari, puis <strong>Sur l'écran d'accueil</strong>. Rouvre ensuite
+            l'app depuis l'icône ajoutée.
+          </div>
+        )}
+
+        {pushSubscribed === false && (!isIOS || isStandalone) && (
+          <button
+            onClick={enableNotifications}
+            className="mb-4 w-full flex items-center justify-between gap-2 bg-indigo-50 border border-indigo-200 rounded-md px-3 py-2.5 text-xs text-indigo-700 hover:bg-indigo-100 transition-colors"
+          >
+            <span>Recevoir un rappel quand un contenu est prévu.</span>
+            <span className="font-medium whitespace-nowrap">Activer →</span>
+          </button>
+        )}
+
+        {pushSubscribed === true && (
+          <div className="mb-4 flex items-center justify-between gap-2 bg-emerald-50 border border-emerald-200 rounded-md px-3 py-2.5 text-xs text-emerald-700">
+            <span>Notifications activées.</span>
+            <button onClick={testNotification} className="font-medium whitespace-nowrap hover:underline">
+              Tester
+            </button>
+          </div>
+        )}
+
+        {pushMsg && (
+          <div
+            className={`mb-4 rounded-md border px-3 py-2 text-xs font-mono ${
+              pushMsg.type === "success"
+                ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                : "bg-rose-50 border-rose-200 text-rose-700"
+            }`}
+          >
+            {pushMsg.text}
+          </div>
         )}
 
         <div className="flex gap-1 mb-4">
